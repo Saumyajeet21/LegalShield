@@ -83,6 +83,38 @@ def test_ordinary_legal_commands_survive():
     assert laven.baseline(page) == []
 
 
+def test_wrapped_model_quote_keeps_pdf_offsets():
+    wrapped = FLAGGED.replace("output ", "output\n")
+    page = Page(1, f"{LEGAL}\n{wrapped}")
+    _, semantic, combined = asyncio.run(laven.analyze_page(page, Scan()))
+    assert len(semantic) == len(combined) == 1
+    assert semantic[0]["start_offset"] == len(LEGAL) + 1
+    assert semantic[0]["quote"] == wrapped
+
+
+def test_document_index_scans_concurrently_and_preserves_page_order(monkeypatch):
+    class DelayedScan:
+        active = peak = calls = 0
+
+        async def json(self, *_args, **_kwargs):
+            self.calls += 1
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            await asyncio.sleep(0)
+            self.active -= 1
+            return {"findings": []}
+
+    groq = DelayedScan()
+    pages = [Page(number, f"{LEGAL}\n{FLAGGED}") for number in range(1, 8)]
+    monkeypatch.setattr(laven, "embed", lambda texts: [[0.0] * 384 for _ in texts])
+    rows, chunks, findings = asyncio.run(laven.index(pages, groq))
+    assert groq.peak == 3
+    assert groq.calls == len(pages)
+    assert [row["page"] for row in rows] == [page.number for page in pages]
+    assert [hit["page"] for hit in findings] == [page.number for page in pages]
+    assert chunks and all(FLAGGED not in row["clean_text"] for row in chunks)
+
+
 class Verifier:
     async def json(self, instruction, data, **_kwargs):
         assert instruction == laven.VERIFY_INSTRUCTION

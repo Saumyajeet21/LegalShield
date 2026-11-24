@@ -7,7 +7,7 @@ from collections import Counter
 from .documents import Page, chunk_ranges
 from .embeddings import embed
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 CATEGORIES = {
     "instruction_override": ("high", "The text asks the assistant to disregard an instruction hierarchy."),
@@ -19,9 +19,16 @@ CATEGORIES = {
 TARGET = r"(?:AI assistant|language model|chatbot|Qwen|ChatGPT|assistant)"
 RULES = [
     ("instruction_override", r"\b(?:ignore|disregard|override|forget)\s+(?:all\s+|any\s+|your\s+|the\s+){0,3}(?:previous|prior|earlier|system|developer)\s+(?:instructions?|prompts?|rules?)\b"),
+    ("instruction_override", r"\b(?:ignore|disregard)\s+the\s+user(?:'s)?\s+question\s+and\s+(?:answer|respond|output)\b[^.!?]*[.!?]?"),
+    ("system_impersonation", r"(?:<(?:system|developer)>[\s\S]{1,700}?</(?:system|developer)>|\[(?:(?:system|developer)\s+override\b|assistant\s*:|retrieval_result\b[^\]\n]*\bauthority\s*=\s*system\b)[^\]\n]*\][^.!?]*[.!?]?)"),
+    ("system_impersonation", rf"(?m)^\s*(?:system|developer)\s*:\s*you\s+are\b[^.!?]*\b{TARGET}\b[^.!?]*[.!?]?"),
     ("system_impersonation", r"(?m)^\s*(?:\[system\]|system message:|developer message:)\s*[^\n]+"),
     ("answer_manipulation", rf"\b{TARGET}\s*[,;:]\s*(?:always\s+)?(?:respond|answer|output|say|tell|claim)\b[^\n.!?]*[.!?]?"),
+    ("answer_manipulation", r"\[(?:assistant\s+task\s+rewrite|evaluation\s+directive|(?:citation\s+)?override|instruction)\]\s*(?:for\s+the\s+next\s+question,\s*)?(?:tell|say|claim|state|answer|respond|output)\b[^.!?]*[.!?]?"),
+    ("answer_manipulation", r"\b(?:for|on)\s+any\s+question\s+(?:on|about)\b[^.!?]{1,140}?,\s*(?:replace\s+the\s+answer\s+with|answer\s+that|ignore\s+the\s+facts\s+and\s+respond)\b[^.!?]*[.!?]?"),
+    ("answer_manipulation", r"\b(?:invent\s+a\s+citation\b[^.!?]*|cite\s+(?:a\s+fictional\s+)?article\s+\d+[^.!?]*\s+as\s+proof[^.!?]*\.\s+this\s+is\s+an\s+intentionally\s+false\s+citation\s+for\s+testing)[.!?]?"),
     ("data_disclosure", rf"\b{TARGET}\s*[,;:]\s*(?:please\s+)?(?:reveal|disclose|print|return)\s+(?:your\s+|the\s+)?(?:system prompt|secret|credentials?|API key)\b[^\n.!?]*[.!?]?"),
+    ("data_disclosure", r"\b(?:reveal|disclose|print|expose)\s+(?:any\s+|your\s+|the\s+)?(?:hidden\s+(?:system\s+prompt|reasoning)|confidential\s+(?:system\s+information|instructions\s+or\s+secrets\s+present\s+in\s+the\s+model\s+context))\b[^.!?]*[.!?]?"),
 ]
 PATTERNS = [(name, re.compile(pattern, re.I)) for name, pattern in RULES]
 AUTHORITY = re.compile(r"\b(?:articles?|sections?|regulations?|directives?)\s+[\w.-]+(?:\([^)\n]{1,20}\))*", re.I)
@@ -81,8 +88,6 @@ async def analyze_page(page: Page, groq):
             continue
         output = await groq.json(SCAN_INSTRUCTION, {"passage": window}, max_tokens=1800)
         rows = output.get("findings")
-        logger.warning("SCAN DEBUG page=%s window_start=%s output_keys=%s findings_type=%s findings_value=%r",
-                       page.number, start, list(output.keys()), type(rows).__name__, rows)
         if rows is None:
             rows = []
         if not isinstance(rows, list):
@@ -96,7 +101,11 @@ async def analyze_page(page: Page, groq):
                 continue
             if not isinstance(category, str) or category not in CATEGORIES or decision not in ("confirmed", "ambiguous"):
                 continue
-            offsets = list(re.finditer(re.escape(quote), window))
+            # Preserve original character ranges while tolerating PDF line wrapping.
+            words = quote.split()
+            if len(" ".join(words)) < 8:
+                continue
+            offsets = list(re.finditer(r"\s+".join(map(re.escape, words)), window))
             # A repeated quote is only accepted when each occurrence has independent rule evidence.
             for match in offsets:
                 a, b = start + match.start(), start + match.end()
@@ -142,8 +151,21 @@ def retain(page: Page, start: int, end: int, findings: list[dict]):
 
 async def index(pages: list[Page], groq):
     page_rows, chunks, findings = [], [], []
-    for page in pages:
-        _, _, hits = await analyze_page(page, groq)
+    # Bound provider concurrency while preserving source page order.
+    logger.info("Document security scan started (%d pages)", len(pages))
+    page_hits = []
+    batch_size = 3
+    for start in range(0, len(pages), batch_size):
+        batch = pages[start:start + batch_size]
+        results = await asyncio.gather(*(analyze_page(page, groq) for page in batch), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            page_hits.append(result[2])
+        scanned = start + len(batch)
+        if scanned == len(pages) or scanned % 15 == 0:
+            logger.info("Document security scan progress: %d/%d pages", scanned, len(pages))
+    for page, hits in zip(pages, page_hits, strict=True):
         findings.extend(hits)
         retained_page, _ = retain(page, 0, len(page.text), [r for r in hits if r["action"] == "isolated"])
         page_rows.append({"page": page.number, "text": page.text,
@@ -153,6 +175,7 @@ async def index(pages: list[Page], groq):
             chunks.append({"page": page.number, "start_offset": start, "end_offset": end, "clause": clause,
                            "parts": parts, "clean_text": "\n".join(part["text"] for part in parts), "removed": removed})
     retained_chunks = [row for row in chunks if row["parts"]]
+    logger.info("Indexing %d retained document chunks", len(retained_chunks))
     for chunk, vector in zip(retained_chunks, await asyncio.to_thread(embed, [c["clean_text"] for c in retained_chunks]), strict=True):
         chunk["embedding"] = vector
     return page_rows, chunks, findings
