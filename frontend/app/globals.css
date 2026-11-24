@@ -101,6 +101,51 @@ svg { flex-shrink:0; }
 .thinking { color:var(--muted); padding:8px; display:flex; align-items:center; gap:8px; }
 .thinking span { width:8px; height:8px; border-radius:50%; background:#997342; animation:pulse 1.3s infinite; }
 .content-page { overflow:auto; width:100%; max-width:1050px; margin:0 auto; padding:30px clamp(14px,4vw,36px) 44px; }
+.analytics-page { max-width:none; }
+.analytics-stack,.analytics-block,.analytics-detail[open] { display:grid; gap:20px; }
+.card.analytics-block,.card.analytics-detail { padding:clamp(16px,2.4vw,30px); }
+.analytics-detail > summary,.operation-metrics summary { cursor:pointer; font-weight:650; }
+.metric-cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,145px),1fr)); gap:12px; margin:12px 0; }
+.metric-card { background:#f5f7fa; border:1px solid var(--line); border-radius:12px; padding:14px 16px; min-width:0; }
+.metric-card dt { color:var(--muted); font-size:.83rem; }
+.metric-card dd { margin:4px 0 0; font-size:clamp(1.15rem,2vw,1.85rem); font-weight:650; overflow-wrap:anywhere; }
+.metrics-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr)); gap:18px; }
+.metric-chart { display:grid; align-content:start; gap:12px; padding:16px; border:1px solid var(--line); border-radius:12px; }
+.metric-chart h3 { margin:0; font-size:1rem; font-weight:650; }
+.metric-row > div { display:flex; justify-content:space-between; align-items:baseline; gap:10px; font-size:.86rem; }
+.metric-row strong { white-space:nowrap; font-variant-numeric:tabular-nums; }
+.metric-row meter { display:block; width:100%; height:16px; margin-top:3px; }
+.metric-row meter::-webkit-meter-bar { border:0; background:#e8edf3; border-radius:9px; }
+.metric-row meter::-webkit-meter-optimum-value { background:#526987; border-radius:9px; }
+.metric-row meter::-moz-meter-bar { background:#526987; border-radius:9px; }
+.metric-highlight meter::-webkit-meter-optimum-value { background:#087a70; }
+.metric-highlight meter::-moz-meter-bar { background:#087a70; }
+.metric-highlight strong { color:#087365; }
+.analytics-chart-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; width:100%; max-width:1240px; align-items:start; }
+.analytics-chart-grid:empty { display:none; }
+.published-plot { margin:0; min-width:0; }
+.published-plot figcaption { font-size:1rem; font-weight:650; margin-bottom:8px; }
+.published-plot img { display:block; width:100%; height:auto; max-height:360px; object-fit:contain; border:1px solid var(--line); border-radius:10px; background:white; }
+@media (max-width:900px) { .analytics-chart-grid { grid-template-columns:minmax(0,1fr); } }
+.operation-metrics { margin:10px 0; }
+.operation-metrics details { margin:8px 0; }
+.operation-metrics .metric-card dd { font-size:1.15rem; }
+.workflow-sources { border:1px solid var(--line); border-radius:10px; padding:12px 16px; min-width:0; }
+.workflow-sources legend { padding:0 6px; font-weight:650; }
+.workflow-sources .check { margin-bottom:5px; }
+.workflow-citations:empty { display:none; }
+.workflow-citations { list-style:none; padding:0; margin:0; }
+.heatmap td,.heatmap th { text-align:center; font-variant-numeric:tabular-nums; }
+.reconstruction-scroll { overflow:auto; }
+.reconstruction-grid { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(140px,1fr); gap:14px; }
+.reconstruction-image { margin:0; min-width:0; }
+.reconstruction-image figcaption { margin-bottom:6px; font-weight:650; }
+.reconstruction-image img { display:block; width:100%; height:auto; border:1px solid var(--line); border-radius:8px; }
+.latent-sample { max-width:240px; margin-top:12px; }
+.dashboard-link { display:flex; align-items:center; gap:14px; padding:22px; text-align:left; }
+.dashboard-link span { flex:1; font-weight:650; }
+.dashboard-link:hover { border-color:#638a88; }
+.document-insights { grid-column:1/-1; min-width:0; }
 .page-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
 .page-heading h1 { font-size:clamp(1.9rem,4vw,2.75rem); }
 .page-heading p { color:var(--muted); margin-top:7px; }

@@ -1,11 +1,13 @@
 import asyncio
 import hashlib
+import json
 import re
 import time
 import zipfile
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from datetime import date, datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -14,11 +16,12 @@ import pymupdf
 from defusedxml.common import DefusedXmlException
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from safetensors import SafetensorError
 
-from . import laven
+from . import generation, laven, reconstruction, research_artifacts, upgraded, verification
 from .config import settings
 from .documents import MAX_BYTES, Page, extract
 from .embeddings import embed
@@ -32,9 +35,18 @@ CATEGORIES = ("Contract", "Legislation", "Court judgment", "Regulation", "Legal 
 async def lifespan(app):
     app.state.supabase = httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10))
     app.state.groq = Groq()
-    yield
-    await app.state.supabase.aclose()
-    await app.state.groq.client.aclose()
+    app.state.verifier = None
+    try:
+        config = settings()
+        if config.laven_enhanced:
+            if not config.laven_verifier_path or not config.laven_calibration_path:
+                raise ValueError("Enhanced LAVEN requires a verifier and matching deployment calibration.")
+            app.state.verifier = await asyncio.to_thread(
+                verification.Verifier.load, config.laven_verifier_path, config.laven_calibration_path)
+        yield
+    finally:
+        await app.state.supabase.aclose()
+        await app.state.groq.client.aclose()
 
 
 app = FastAPI(title="LegalShield AI", version="1.0.0", lifespan=lifespan)
@@ -138,7 +150,7 @@ async def health():
 
 @app.get("/session")
 async def session(store: Store = Depends(authenticated)):
-    return {"researcher": store.researcher}
+    return {"researcher": store.researcher, "laven_enhanced": settings().laven_enhanced}
 
 
 @app.get("/connection")
@@ -203,6 +215,36 @@ async def preview(document_id: UUID, page: int = Query(1, ge=1), store: Store = 
     return {"document": public_doc(row), "page": values[0], "findings": findings}
 
 
+@app.get("/documents/{document_id}/scan-metrics")
+async def scan_metrics(document_id: UUID, store: Store = Depends(authenticated)):
+    source = await document(store, document_id)
+    scope = {"document_id": f"eq.{document_id}", "order": "page,id"}
+    chunks, findings = await asyncio.gather(
+        all_rows(store, "document_chunks", max_rows=5001, select="page,start_offset,end_offset,parts", **scope),
+        all_rows(store, "security_findings", max_rows=5001, select="page,action", **scope))
+    if (await document(store, document_id))["revision"] != source["revision"]:
+        raise HTTPException(409, "The document changed. Reopen its scan results.")
+    if len(chunks) == 5001 or len(findings) == 5001:
+        raise HTTPException(422, "This document exceeds the detailed scan reporting limit.")
+    def covered(retained):
+        ranges = sorted((row["page"], part["start"], part["end"]) for row in chunks
+                        for part in (row["parts"] if retained else
+                                     [{"start": row["start_offset"], "end": row["end_offset"]}]))
+        count, last_page, previous_end = 0, None, 0
+        for page, start, end in ranges:
+            if page != last_page:
+                last_page, previous_end = page, 0
+            count += max(0, end - max(start, previous_end))
+            previous_end = max(previous_end, end)
+        return count
+    total, retained = covered(False), covered(True)
+    return {"spans": len(findings), "affected_pages": len({row["page"] for row in findings}),
+            "isolated": sum(row["action"] == "isolated" for row in findings),
+            "quarantined": sum(row["action"] == "quarantined" for row in findings),
+            "retention": retained / total if total else None, "retained_characters": retained,
+            "candidate_characters": total, "confidence": None}
+
+
 @app.get("/documents/{document_id}/original")
 async def original(document_id: UUID, store: Store = Depends(authenticated)):
     row = await document(store, document_id)
@@ -244,6 +286,8 @@ class Question(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
     document_ids: list[UUID] = Field(min_length=1, max_length=20)
     conversation_id: UUID | None = None
+    as_of: date | None = None
+    compare_baseline: bool = False
 
 
 async def search(store, question, ids):
@@ -266,6 +310,7 @@ async def get_conversation(store, conversation_id):
 
 @app.post("/ask")
 async def ask(body: Question, request: Request, store: Store = Depends(authenticated)):
+    started = time.perf_counter()
     question = body.question.strip()
     if len(question) < 3:
         raise HTTPException(422, "Enter a legal research question.")
@@ -275,13 +320,67 @@ async def ask(body: Question, request: Request, store: Store = Depends(authentic
     if body.conversation_id:
         await get_conversation(store, body.conversation_id)
     flags = laven.baseline(Page(0, question))
-    hits, trusted = ([], []) if flags else await search(store, question, ids)
-    findings = await read_findings(store, ids)
-    claims = [] if flags else await laven.grounded(request.app.state.groq, question, hits, trusted)
-    result = {"document_ids": [str(item) for item in ids], "claims": claims, "message": ("The question contains a potential AI-directed instruction. Rephrase it as a legal research question." if flags else laven.INSUFFICIENT) if not claims else None,
+    config, groq = settings(), request.app.state.groq
+    as_of = (body.as_of or datetime.now(timezone.utc).date()).isoformat()
+    effective_ids, versions, issues = ids, {}, []
+    if config.laven_enhanced and not flags:
+        effective_ids, versions, issues = await upgraded.applicable_versions(store, ids, as_of)
+        for identifier in effective_ids:
+            source = await document(store, identifier)
+            key = str(identifier)
+            if key in versions and versions[key]["sha256"] != source["sha256"]:
+                raise HTTPException(409, "Reviewed version no longer matches its recorded source.")
+            versions[key] = {**versions.get(key, {}), "sha256": source["sha256"]}
+    source_ids = list(dict.fromkeys(map(str, [*ids, *effective_ids])))
+    hits, trusted = ([], []) if flags or issues or not effective_ids else await search(store, question, effective_ids)
+    if config.laven_enhanced and trusted:
+        reference_ids = list(dict.fromkeys(item["document_id"] for item in trusted))
+        applicable, _, _ = await upgraded.applicable_versions(store, reference_ids, as_of)
+        allowed_references = set(applicable)
+        trusted = [item for item in trusted if item["document_id"] in allowed_references]
+    findings = await read_findings(store, source_ids)
+    record = None
+    if flags:
+        claims = []
+    elif config.laven_enhanced:
+        try:
+            with groq.track_usage() as usage:
+                async with asyncio.timeout(config.laven_answer_timeout):
+                    claims, record = await verification.verified_answer(
+                        groq, request.app.state.verifier, question, hits, trusted, versions,
+                        max_retries=config.laven_regeneration_attempts, sample_count=config.laven_sample_count,
+                        max_entropy=config.laven_max_entropy, as_of=as_of, document_ids=[str(i) for i in ids],
+                        authority_issues=issues)
+        except TimeoutError as error:
+            raise HTTPException(504, "Verification exceeded the answer time budget.") from error
+    else:
+        claims = await laven.grounded(groq, question, hits, trusted)
+    result = {"document_ids": source_ids, "claims": claims, "message": ("The question contains a potential AI-directed instruction. Rephrase it as a legal research question." if flags else laven.INSUFFICIENT) if not claims else None,
         "alerts": findings, "question_flagged": bool(flags),
         "retrieval": [{"id": h["id"], "document_id": h["document_id"], "page": h["page"], "revision": h["revision"],
                        "similarity": h["similarity"]} for h in hits]}
+    if record is not None:
+        content = {key: value for key, value in record.items() if key != "record_sha256"}
+        result["verification"] = verification.seal({**content, "groq_usage": usage})
+        if record["status"] == "verifier_unavailable":
+            result["message"] = "The independent verifier is unavailable."
+        elif issues:
+            result["message"] = " ".join(issues)
+        elif record["status"] == "uncertain":
+            result["message"] = "The answer candidates did not provide sufficient agreement."
+        if body.compare_baseline and hits:
+            baseline_started = time.perf_counter()
+            try:
+                async with asyncio.timeout(min(30, config.laven_answer_timeout)):
+                    baseline_claims = await laven.grounded(groq, question, hits, trusted)
+            except (TimeoutError, HTTPException):
+                pass
+            else:
+                result["comparison"] = {
+                    "baseline": {"claims": len(baseline_claims), "latency_ms": round((time.perf_counter() - baseline_started) * 1000)},
+                    "verified": {"claims": len(claims), "latency_ms": record.get("generation_ms", 0) + (record.get("verification_ms") or 0)},
+                }
+    result["response_latency_ms"] = round((time.perf_counter() - started) * 1000)
     conversation_id = str(body.conversation_id or uuid4())
     saved = await store.rpc("save_turn", {"p_owner": store.owner, "p_conversation": conversation_id,
         "p_create": body.conversation_id is None, "p_question": question,
@@ -300,6 +399,68 @@ async def conversations(store: Store = Depends(authenticated)):
 async def history(conversation_id: UUID, store: Store = Depends(authenticated)):
     await get_conversation(store, conversation_id)
     return await all_rows(store, "chat_turns", conversation_id=f"eq.{conversation_id}", order="id")
+
+
+@app.post("/documents/{document_id}/legal-version", status_code=201)
+async def register_legal_version(document_id: UUID, body: upgraded.VersionRegistration,
+                                 store: Store = Depends(researcher)):
+    source = await document(store, document_id)
+    if not settings().laven_enhanced:
+        raise HTTPException(404, "Legal version registration is disabled.")
+    if body.authority_status == "verified" and not (source["trusted"] or source["synthetic"]):
+        raise HTTPException(422, "Verified versions require an explicitly trusted or synthetic source.")
+    current = await store.read("legal_document_versions", document_id=f"eq.{document_id}", limit=1)
+    if current:
+        raise HTTPException(409, "This source already has a legal version registration.")
+    rows = await store.write("POST", "legal_document_versions", data={
+        **body.model_dump(mode="json"), "document_id": str(document_id), "sha256": source["sha256"]})
+    return rows[0]
+
+
+@app.get("/documents/{document_id}/legal-versions")
+async def legal_versions(document_id: UUID, store: Store = Depends(authenticated)):
+    await document(store, document_id)
+    if not settings().laven_enhanced:
+        raise HTTPException(404, "Legal versions are disabled.")
+    rows = await store.read("legal_document_versions", document_id=f"eq.{document_id}", limit=1)
+    return await all_rows(store, "legal_document_versions", family_id=f"eq.{rows[0]['family_id']}",
+                          order="effective_from,precedence") if rows else []
+
+
+@app.get("/documents/{document_id}/legal-change")
+async def legal_change(document_id: UUID, before: UUID, store: Store = Depends(authenticated)):
+    for identifier in (document_id, before):
+        await document(store, identifier)
+    if not settings().laven_enhanced:
+        raise HTTPException(404, "Legal versions are disabled.")
+    if document_id == before:
+        raise HTTPException(422, "Select two different legal versions.")
+    ids = [before, document_id]
+    rows = await store.read("legal_document_versions", document_id="in.(" + ",".join(map(str, ids)) + ")", limit=2)
+    if len(rows) != 2 or rows[0]["family_id"] != rows[1]["family_id"]:
+        raise HTTPException(422, "Select two registered versions in the same document family.")
+    old_pages, new_pages, findings = await asyncio.gather(
+        all_rows(store, "document_pages", max_rows=300, document_id=f"eq.{before}", order="page", select="page,text"),
+        all_rows(store, "document_pages", max_rows=300, document_id=f"eq.{document_id}", order="page", select="page,text"),
+        read_findings(store, ids),
+    )
+    return await asyncio.to_thread(
+        upgraded.summarize_version_changes, old_pages, new_pages,
+        [item for item in findings if item["document_id"] == str(before)],
+        [item for item in findings if item["document_id"] == str(document_id)],
+    )
+
+
+@app.get("/conversations/{conversation_id}/verification/{question_id}.pdf")
+async def verification_pdf(conversation_id: UUID, question_id: UUID,
+                           store: Store = Depends(authenticated)):
+    rows = await store.read("chat_turns", conversation_id=f"eq.{conversation_id}", limit=1,
+                            **{"result->verification->>question_id": f"eq.{question_id}"})
+    if not rows or not rows[0]["result"].get("verification"):
+        raise HTTPException(404, "Verification record unavailable.")
+    result = await asyncio.to_thread(upgraded.report_pdf, rows[0]["result"]["verification"])
+    return Response(result, media_type="application/pdf", headers={
+        "Cache-Control": "private, no-store", "Content-Disposition": "attachment; filename=laven-verification.pdf"})
 
 
 class GoldSpan(BaseModel):
@@ -407,3 +568,180 @@ async def experiment(body: Experiment, request: Request, store: Store = Depends(
 @app.get("/research")
 async def experiments(store: Store = Depends(researcher)):
     return await all_rows(store, "research_experiments", order="created_at.desc,id")
+
+
+@app.get("/research/artifacts")
+async def published_research(store: Store = Depends(researcher)):
+    try:
+        return await asyncio.to_thread(research_artifacts.read_index, settings().laven_research_index)
+    except ValueError as error:
+        raise HTTPException(503, "The published aggregate index is unreadable.") from error
+
+
+@app.get("/research/comparison")
+async def published_comparison(store: Store = Depends(researcher)):
+    try:
+        return {"models": await asyncio.to_thread(research_artifacts.model_comparison),
+                "charts": [key for key in research_artifacts.CHARTS if research_artifacts.chart_path(key)]}
+    except (OSError, KeyError, ValueError) as error:
+        raise HTTPException(503, "The published model comparison is unreadable.") from error
+
+
+@app.get("/research/charts/{chart}")
+async def published_chart(chart: str, store: Store = Depends(researcher)):
+    path = research_artifacts.chart_path(chart)
+    if path is None:
+        raise HTTPException(404, "This chart has not been published.")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, no-store",
+                                                               "X-Content-Type-Options": "nosniff"})
+
+
+@app.post("/generation/drafts")
+async def generate_documents(body: generation.DraftRequest, request: Request, store: Store = Depends(authenticated)):
+    identifiers = list(dict.fromkeys(body.document_ids))
+    for identifier in identifiers:
+        await document(store, identifier)
+    query = " ".join([body.kind, *body.requirements.values(), body.instructions])[:2500]
+    hits, trusted = await search(store, query, identifiers) if identifiers else ([], [])
+    try:
+        async with asyncio.timeout(150):
+            return await generation.generate_drafts(request.app.state.groq, request.app.state.verifier, body, hits, trusted)
+    except TimeoutError as error:
+        raise HTTPException(504, "Drafting reached its time limit. Try fewer drafts.") from error
+
+
+@app.post("/generation/export/{format}")
+async def download_generated(format: str, body: generation.Export, store: Store = Depends(authenticated)):
+    formats = {"pdf": (generation.export_pdf, "application/pdf"),
+               "docx": (generation.export_docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
+    if format not in formats:
+        raise HTTPException(404, "This file format is unavailable.")
+    render, media_type = formats[format]
+    output = await asyncio.to_thread(render, body.title, body.text.splitlines())
+    return Response(output, media_type=media_type,
+                    headers={"Cache-Control": "private, no-store", "Content-Disposition": f'attachment; filename="laven-generated.{format}"'})
+
+
+class ReconstructionRequest(BaseModel):
+    page: int = Field(1, ge=1, le=300)
+    model: Literal["ae", "vae", "both"] = "ae"
+    degradation: Literal["gaussian", "blur", "contrast", "speckle", "compression"] = "gaussian"
+    controlled: bool = True
+    severity: float = Field(.5, ge=0, le=1)
+
+
+class LatentRequest(BaseModel):
+    seed: int = Field(2026, ge=0, le=10**9)
+    coordinates: list[Annotated[float, Field(ge=-4, le=4)]] = Field(default_factory=list, max_length=4)
+
+
+@app.get("/reconstruction/status")
+async def reconstruction_status(store: Store = Depends(authenticated)):
+    location = settings().laven_reconstruction_path
+    if location:
+        try:
+            await asyncio.to_thread(reconstruction.load_models, location)
+            return {"available": True}
+        except (OSError, ValueError, KeyError, RuntimeError, SafetensorError):
+            return {"available": False, "message": "Reconstruction checkpoints failed verification."}
+    return {"available": False, "message": "Not Trained · Import the AE and VAE Colab export to enable reconstruction."}
+
+
+@app.get("/research/reconstruction")
+async def published_reconstruction(store: Store = Depends(researcher)):
+    location = settings().laven_reconstruction_path
+    if not location:
+        return None
+    await reconstruction_models()
+    root = Path(location)
+    try:
+        metrics = json.loads((root / "metrics.json").read_text(encoding="utf-8"))
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        protocol = manifest["protocol"]
+        source = {reconstruction.TEXT_PROTOCOL: "ContractNLI pages with controlled blur",
+                  reconstruction.DAE_PROTOCOL: "ContractNLI pages with controlled blur, noise or scan degradation"}
+        return {"metrics": metrics, "test_count": manifest["split_counts"]["test"],
+                "test_source": source.get(protocol, "fictional source documents"),
+                "primary_model": "Denoising autoencoder" if protocol == reconstruction.DAE_PROTOCOL else "Autoencoder",
+                "charts": [{"name": name, "title": title} for name, title in reconstruction.PLOTS.items()
+                           if (root / "figures" / (name + ".png")).is_file()]}
+    except (OSError, ValueError, KeyError) as error:
+        raise HTTPException(503, "Reconstruction evaluation results are unavailable.") from error
+
+
+@app.get("/research/reconstruction/charts/{chart}")
+async def published_reconstruction_chart(chart: str, store: Store = Depends(researcher)):
+    if chart not in reconstruction.PLOTS:
+        raise HTTPException(404, "This chart does not exist.")
+    await reconstruction_models()
+    path = Path(settings().laven_reconstruction_path) / "figures" / (chart + ".png")
+    if not path.is_file():
+        raise HTTPException(404, "This chart has not been published.")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, no-store"})
+
+
+async def reconstruction_models():
+    if not settings().laven_reconstruction_path:
+        raise HTTPException(503, "Reconstruction checkpoints have not been imported.")
+    try:
+        return await asyncio.to_thread(reconstruction.load_models, settings().laven_reconstruction_path)
+    except (OSError, ValueError, KeyError, RuntimeError, SafetensorError) as error:
+        raise HTTPException(503, "Reconstruction checkpoints failed verification.") from error
+
+
+@app.post("/reconstruction/upload")
+async def restore_upload(request: Request, page: int = Query(1, ge=1, le=300),
+                         model: Literal["ae", "vae", "both"] = "ae", store: Store = Depends(authenticated)):
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > MAX_BYTES:
+            raise HTTPException(413, "Restoration uploads are limited to 20 MiB.")
+        data.extend(chunk)
+    if data.startswith(b"%PDF-"):
+        kind, source = "pdf", f"Uploaded PDF · page {page}"
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        kind, source = "png", "Uploaded image"
+    elif data.startswith(b"\xff\xd8\xff"):
+        kind, source = "jpeg", "Uploaded image"
+    else:
+        raise HTTPException(415, "Choose a PDF, PNG or JPEG file.")
+    models = await reconstruction_models()
+    try:
+        image, page_count = await asyncio.to_thread(reconstruction.render_upload, bytes(data), page, kind)
+    except ValueError as error:
+        detail = str(error) if type(error) is ValueError else "This file could not be rendered."
+        raise HTTPException(422, detail) from error
+    except (pymupdf.FileDataError, RuntimeError, OverflowError) as error:
+        raise HTTPException(422, "This file could not be rendered.") from error
+    selected = models if model == "both" else {model: models[model]}
+    result = await asyncio.to_thread(reconstruction.reconstruct, selected, image, "gaussian", False, .5)
+    return JSONResponse({**result, "source_kind": source, "page_count": page_count},
+                        headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/documents/{document_id}/reconstruction")
+async def reconstruct_document(document_id: UUID, body: ReconstructionRequest, store: Store = Depends(authenticated)):
+    row = await document(store, document_id)
+    if body.page > row["page_count"]:
+        raise HTTPException(404, "This page is unavailable.")
+    models = await reconstruction_models()
+    selected = models if body.model == "both" else {body.model: models[body.model]}
+    if row["media_type"] == "application/pdf":
+        original_bytes = await store.get_original(row["object_path"])
+        rendered = await asyncio.to_thread(reconstruction.render_page, original_bytes, body.page)
+        source_kind = "Original page render"
+    else:
+        pages = await store.read("document_pages", document_id=f"eq.{document_id}", page=f"eq.{body.page}", select="text", limit=1)
+        if not pages:
+            raise HTTPException(404, "This extracted page is unavailable.")
+        rendered = await asyncio.to_thread(reconstruction.render_page, None, body.page, text=pages[0]["text"])
+        source_kind = "Extracted text render"
+    result = await asyncio.to_thread(reconstruction.reconstruct, selected, rendered, body.degradation, body.controlled, body.severity)
+    return {**result, "source_kind": source_kind}
+
+
+@app.post("/reconstruction/latent")
+async def generate_latent(body: LatentRequest, store: Store = Depends(authenticated)):
+    models = await reconstruction_models()
+    image = await asyncio.to_thread(reconstruction.latent_sample, models["vae"], body.seed, body.coordinates)
+    return {"image": image}

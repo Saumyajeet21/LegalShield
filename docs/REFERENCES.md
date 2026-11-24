@@ -1,0 +1,18 @@
+# Primary references
+
+- [Koreeda and Manning, ContractNLI](https://aclanthology.org/2021.findings-emnlp.164/)
+- [Hendrycks et al., CUAD](https://arxiv.org/abs/2103.06268)
+- [Guha et al., LegalBench](https://arxiv.org/abs/2308.11462)
+- [Pipitone and Houir Alami, LegalBench-RAG](https://arxiv.org/abs/2408.10343)
+- [Yi et al., BIPIA](https://arxiv.org/abs/2312.14197)
+- [Hochreiter and Schmidhuber, LSTM](https://pubmed.ncbi.nlm.nih.gov/9377276/)
+- [Vaswani et al., Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+- [He et al., DeBERTa-v3](https://arxiv.org/abs/2111.09543)
+- [Asai et al., Self-RAG](https://arxiv.org/abs/2310.11511)
+- [Chen et al., RGB](https://arxiv.org/abs/2309.01431)
+- [Chen et al., Counterfactual Prompting](https://aclanthology.org/2024.findings-emnlp.133/)
+- [Farquhar et al., Semantic Entropy](https://www.nature.com/articles/s41586-024-07421-0)
+- [Guo et al., Calibration](https://arxiv.org/abs/1706.04599)
+- [Angelopoulos et al., Conformal Risk Control](https://arxiv.org/abs/2208.02814)
+- [LegalRuleML](https://docs.oasis-open.org/legalruleml/legalruleml-core-spec/v1.0/os/legalruleml-core-spec-v1.0-os.html)
+- [LegalAssist](https://www.mdpi.com/2673-4591/143/1/86)

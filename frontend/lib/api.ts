@@ -3,16 +3,62 @@ import type { Session } from "@supabase/supabase-js";
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const recoveryKey = "legalshield:password-recovery";
+const callback = typeof window === "undefined" ? null : new URLSearchParams(window.location.hash.slice(1));
+let recoveryLink = callback?.get("type") === "recovery" || callback?.get("error_code") === "otp_expired";
+let recoveryPending = Boolean(callback?.get("type") === "recovery" && callback.get("access_token") && callback.get("refresh_token"));
+let recoveryUser: string | null = null;
 export const supabase = url && key ? createClient(url, key) : null;
+if (typeof window !== "undefined") {
+  try {
+    if (recoveryLink) window.sessionStorage.removeItem(recoveryKey);
+    else recoveryUser = window.sessionStorage.getItem(recoveryKey);
+  } catch { /* Storage can be disabled. */ }
+  // Capture recovery before React subscribes. Supabase may clear the callback hash on initialization.
+  supabase?.auth.onAuthStateChange((event, session) => {
+    if (event === "PASSWORD_RECOVERY" && session) {
+      recoveryPending = false;
+      recoveryUser = session.user.id;
+      try { window.sessionStorage.setItem(recoveryKey, recoveryUser); } catch { /* Use in-memory state. */ }
+    }
+  });
+}
+
+export function passwordRecoveryMode(session: Session | null) {
+  if (recoveryUser && recoveryUser === session?.user.id) return "verified";
+  if (recoveryPending) return "pending";
+  return recoveryLink || recoveryUser ? "unavailable" : null;
+}
+
+export function failPasswordRecovery() {
+  recoveryPending = false;
+}
+
+export function clearPasswordRecovery() {
+  recoveryUser = null;
+  recoveryLink = false;
+  recoveryPending = false;
+  try { window.sessionStorage.removeItem(recoveryKey); } catch { /* Storage can be disabled. */ }
+  const hash = new URLSearchParams(window.location.hash.slice(1));
+  if (hash.get("type") === "recovery" || hash.get("error_code") === "otp_expired") {
+    window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
+  }
+}
 const apiBase = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/$/, "");
 
 export type Doc = {id: string; name: string; media_type: string; category: string; page_count: number; finding_count: number;
   status: "processing" | "indexed" | "deleting"; synthetic: boolean; trusted: boolean; created_at: string};
 export type Finding = {id: string; document_id: string; name?: string; page: number; quote?: string; category: string;
   severity: string; reason: string; action: string; boxes: [number, number, number, number][]; start_offset: number; end_offset: number};
-export type Citation = {document_id: string; name: string; page: number; clause: string | null; quote: string; start_offset: number; end_offset: number};
+export type Citation = {document_id: string; name: string; page: number; clause: string | null; quote: string; start_offset: number; end_offset: number; legal_version?: string | null};
 export type Claim = {text: string; citations: Citation[]; authority: null | {references: string[]; status: string; source?: {document_id: string; page: number; quote: string}}};
-export type Answer = {claims: Claim[]; message: string | null; alerts: Finding[]; conversation_id?: string; question_flagged: boolean;
+type VerificationRecord = {question_id: string; status: string; as_of: string | null; semantic_entropy: number | null;
+  authority_issues: string[];
+  evidence_graph?: {nodes: {id: string; kind: "claim" | "citation" | "rule"; source?: Citation}[];
+    edges: {from: string; to: string; relation: string}[]};
+  attempts: {claims?: {text: string; status: string; unresolved_conditions: string[]; citations: Citation[]}[]}[]};
+export type Answer = {verification?: VerificationRecord; response_latency_ms?: number; claims: Claim[]; message: string | null; alerts: Finding[]; conversation_id?: string; question_flagged: boolean;
+  comparison?: Record<"baseline" | "verified", {claims: number; latency_ms: number}>;
   retrieval: {id: number; document_id: string; page: number; similarity: number}[]};
 export type Turn = {id?: number; question: string; result?: Answer};
 export type Conversation = {id: string; title: string};
@@ -68,11 +114,21 @@ export async function upload(session: Session, data: FormData, progress: (amount
     xhr.setRequestHeader("Authorization", `Bearer ${bearer}`);
     xhr.responseType = "json";
     xhr.upload.addEventListener("progress", event => {
-      if (event.lengthComputable) progress(Math.round(event.loaded / event.total * 100));
+      if (event.lengthComputable && event.total > 0) progress(Math.min(99, Math.round(event.loaded / event.total * 100)));
     });
+    xhr.upload.addEventListener("load", () => progress(100));
     xhr.onload = () => xhr.status === 201 ? resolve(xhr.response as Doc) : reject(new Error(detail(xhr.response?.detail)));
     xhr.onerror = () => reject(new Error("The backend could not be reached."));
     xhr.onabort = () => reject(new Error("Upload canceled."));
     xhr.send(data);
   });
+}
+
+
+export async function artifact(session: Session, path: string, init?: RequestInit) {
+  const response = await fetch(apiBase + path, {...init, cache: "no-store",
+    headers: {Authorization: "Bearer " + await token(session),
+      ...(init?.body ? {"Content-Type": "application/json"} : {}), ...init?.headers}});
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
 }

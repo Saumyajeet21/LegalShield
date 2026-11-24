@@ -5,13 +5,25 @@ import type { Session } from "@supabase/supabase-js";
 import { motion } from "motion/react";
 import Markdown from "react-markdown";
 import { ArrowDownToLine, ArrowRight, ArrowUp, Bell, BookOpen, Check, ChevronDown, CircleAlert, Copy, FileText, FlaskConical, FolderClosed, Landmark, LogOut, Menu, MessageSquare, Paperclip, Plus, RefreshCw, Search, Settings, ShieldAlert, ShieldCheck, UploadCloud, X } from "lucide-react";
-import { original, request, supabase, upload, type Answer, type Conversation, type Doc, type Finding, type Target, type Turn } from "@/lib/api";
+import { clearPasswordRecovery, failPasswordRecovery, original, passwordRecoveryMode, request, supabase, upload, type Answer, type Conversation, type Doc, type Finding, type Target, type Turn } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Viewer, downloadBlob } from "@/components/viewer";
 import { Research } from "@/components/research";
+import { VerificationDetails } from "@/components/verification-details";
+import { LegalVersions } from "@/components/legal-versions";
+import { AnswerMetrics, ScanResults } from "@/components/operation-metrics";
+import { GenerationStudio } from "@/components/generative-workflows";
+import { DocumentRestoration } from "@/components/document-reconstruction";
+import { MetricCards } from "@/components/metrics";
 
-type View = "assistant" | "documents" | "alerts" | "research";
-const NAV = [{id: "assistant", label: "AI Legal Assistant", icon: MessageSquare}, {id: "documents", label: "My Documents", icon: FolderClosed}, {id: "alerts", label: "Security Alerts", icon: ShieldAlert}] as const;
+type View = "dashboard" | "assistant" | "documents" | "restoration" | "studio" | "alerts" | "research";
+const NAV = [{id: "dashboard", label: "Dashboard", icon: BookOpen},
+  {id: "assistant", label: "AI Legal Assistant", icon: MessageSquare}, {id: "documents", label: "My Documents", icon: FolderClosed},
+  {id: "restoration", label: "Document Restoration", icon: FileText},
+  {id: "studio", label: "Legal Generation Studio", icon: FileText},
+  {id: "alerts", label: "Security Alerts", icon: ShieldAlert}, {id: "research", label: "AI Performance & Analytics", icon: FlaskConical}] as const;
+type WorkspaceAccess = {researcher: boolean; laven_enhanced?: boolean};
+
 const SUGGESTIONS = ["What are the obligations of the parties in this contract?", "Summarize the important clauses of this agreement.", "What compliance requirements apply under this regulation?", "Are there any conflicting or unusual provisions?"];
 const CATEGORIES = ["Contract", "Legislation", "Court judgment", "Regulation", "Legal notice", "Other"];
 
@@ -28,6 +40,13 @@ function Illustration() {
 }
 
 type AuthView = "signin" | "signup" | "forgot" | "forgot-sent";
+
+function AuthVisual() {
+  return <div className="login-visual">
+    <Brand/>
+    <div><Illustration/><h1>Legal research<br/>with evidence in view.</h1><p>Review your documents, trace legal answers to their sources, and inspect suspicious instructions in context.</p></div>
+  </div>;
+}
 
 function SignIn() {
   const [view, setView] = useState<AuthView>("signin");
@@ -81,10 +100,7 @@ function SignIn() {
     finally { setBusy(false); }
   }
 
-  const visual = <div className="login-visual">
-    <Brand/>
-    <div><Illustration/><h1>Legal research<br/>with evidence in view.</h1><p>Review your documents, trace legal answers to their sources, and inspect suspicious instructions in context.</p></div>
-  </div>;
+  const visual = <AuthVisual/>;
 
   if (view === "forgot-sent") return <main className="login">{visual}
     <div className="login-content"><div className="form-stack login-form">
@@ -175,11 +191,19 @@ function UploadDialog({session, researcher, initial, close, complete}: {session:
   const controller = useRef<AbortController | null>(null);
   const [file, setFile] = useState(initial);
   const [progress, setProgress] = useState<number | null>(null);
+  const [scanSeconds, setScanSeconds] = useState(0);
   const [error, setError] = useState("");
+  const indexing = progress === 100;
   useEffect(() => {
     dialog.current?.showModal();
     return () => controller.current?.abort();
   }, []);
+  useEffect(() => {
+    if (!indexing) return;
+    const started = Date.now();
+    const timer = window.setInterval(() => setScanSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [indexing]);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!file || !/\.(pdf|docx|txt)$/i.test(file.name) || file.size === 0 || file.size > 20 * 1024 * 1024) {
@@ -188,7 +212,7 @@ function UploadDialog({session, researcher, initial, close, complete}: {session:
     const data = new FormData(event.currentTarget);
     data.set("file", file);
     if (data.has("trusted") && data.has("synthetic")) {setError("Choose either synthetic or trusted reference."); return;}
-    setError(""); setProgress(0);
+    setError(""); setScanSeconds(0); setProgress(0);
     const operation = new AbortController();
     controller.current = operation;
     try { complete(await upload(session, data, setProgress, operation.signal)); }
@@ -205,7 +229,11 @@ function UploadDialog({session, researcher, initial, close, complete}: {session:
       <label>Category<select name="category" defaultValue="Other" disabled={progress !== null}>{CATEGORIES.map(category => <option key={category}>{category}</option>)}</select></label>
       {researcher && <><label className="check"><input name="synthetic" type="checkbox" value="true" disabled={progress !== null}/> Synthetic research document</label><label className="check"><input name="trusted" type="checkbox" value="true" disabled={progress !== null}/> Explicitly trusted legal reference</label></>}
       {error && <p role="alert" className="notice error">{error}</p>}
-      {progress !== null && <div role="status"><progress value={progress < 100 ? progress : undefined} max={100}/><p className="muted">{progress >= 100 ? "Scanning and indexing document…" : `Uploading ${progress}%`}</p></div>}
+      {progress !== null && <div>
+        <progress aria-label={indexing ? "Scanning and indexing" : "File transfer"} value={indexing ? undefined : progress} max={100}/>
+        <p role="status" className="muted">{indexing ? "File transferred. Scanning and indexing can take a few minutes." : `Uploading ${progress}%`}</p>
+        {indexing && <p className="muted">Elapsed: {Math.floor(scanSeconds / 60)}m {scanSeconds % 60}s</p>}
+      </div>}
       <Button type="submit" disabled={!file || progress !== null}><UploadCloud size={17}/> Upload and scan</Button>
     </form>
   </dialog>;
@@ -222,7 +250,11 @@ function Workspace({session}: {session: Session}) {
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [researcher, setResearcher] = useState(false);
+  const [workspaceAccess, setWorkspaceAccess] = useState<WorkspaceAccess | null>();
+  const researcher = workspaceAccess?.researcher === true;
+  const enhanced = workspaceAccess?.laven_enhanced === true;
+  const [asOf, setAsOf] = useState("");
+  const [compareBaseline, setCompareBaseline] = useState(false);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [drawer, setDrawer] = useState(false);
@@ -238,16 +270,17 @@ function Workspace({session}: {session: Session}) {
   const end = useRef<HTMLDivElement>(null);
 
   async function refresh() {
+    const access = request<WorkspaceAccess>(session, "/session").then(setWorkspaceAccess, () => setWorkspaceAccess(null));
     try {
-      const [documents, findings, history, role] = await Promise.all([
+      const [documents, findings, history] = await Promise.all([
         request<Doc[]>(session, "/documents"), request<Finding[]>(session, "/alerts"),
-        request<Conversation[]>(session, "/conversations"), request<{researcher: boolean}>(session, "/session")
+        request<Conversation[]>(session, "/conversations")
       ]);
-      setDocs(documents); setAlerts(findings); setConversations(history); setResearcher(role.researcher);
+      setDocs(documents); setAlerts(findings); setConversations(history);
       const active = documents.filter(doc => doc.status === "indexed").map(doc => doc.id);
       setSelected(previous => previous.length ? previous.filter(id => active.includes(id)) : active.length === 1 ? active : []);
     } catch (failure) { setError(failure instanceof Error ? failure.message : "Could not load the workspace."); }
-    finally { setLoading(false); }
+    finally { await access; setLoading(false); }
   }
 
   useEffect(() => { void refresh(); }, [session]);
@@ -273,7 +306,8 @@ function Workspace({session}: {session: Session}) {
     setError(""); setBusy(true); setQuestion(""); setTurns(previous => [...previous, {question: text}]);
     try {
       const answer = await request<Answer>(session, "/ask", {method: "POST",
-        body: JSON.stringify({question: text, document_ids: selected, conversation_id: conversation})});
+        body: JSON.stringify({question: text, document_ids: selected, conversation_id: conversation, as_of: asOf || undefined,
+          compare_baseline: enhanced && compareBaseline})});
       setTurns(previous => [...previous.slice(0, -1), {question: text, result: answer}]);
       setConversation(answer.conversation_id);
       request<Conversation[]>(session, "/conversations").then(setConversations).catch(() => undefined);
@@ -321,7 +355,6 @@ function Workspace({session}: {session: Session}) {
       </div>
       <div className="account">
         {settings && <div className="account-menu">
-          {researcher && <button type="button" onClick={() => navigate("research")}><FlaskConical size={16}/> Research laboratory</button>}
           <button type="button" onClick={async () => {
             setConnection("Checking connections…");
             try { const result = await request<{model: string}>(session, "/connection"); setConnection(`Connected to Groq (${result.model}) and Supabase.`); }
@@ -340,6 +373,13 @@ function Workspace({session}: {session: Session}) {
       </header>
       {error && <div className="global-error"><p className="notice error" role="alert"><CircleAlert size={17}/>{error} <button type="button" className="text-link" onClick={() => setError("")}>Dismiss</button></p></div>}
       {loading && <div className="loading-bar" role="status" aria-label="Loading workspace"/>}
+      {view === "dashboard" && <section className="content-page analytics-page analytics-stack">
+        <div className="page-heading"><div><h1>Workspace dashboard</h1><p>Open your document library, AI tools or measured model results.</p></div></div>
+        <MetricCards items={[{label: "Indexed documents", value: loading ? null : docs.filter(doc => doc.status === "indexed").length},
+          {label: "Conversations", value: loading ? null : conversations.length}, {label: "Security findings", value: loading ? null : alerts.length}]}/>
+        <div className="metrics-grid">{NAV.filter(item => item.id !== "dashboard").map(({id, icon: Icon, label}) =>
+          <button type="button" key={id} className="card dashboard-link" onClick={() => navigate(id)}><Icon size={24}/><span>{label}</span><ArrowRight size={17}/></button>)}</div>
+      </section>}
       {view === "assistant" && <div className="assistant">
         <div className={`chat-scroll ${turns.length ? "" : "empty-chat"}`}>
           {turns.length === 0 && <motion.section className="hero" initial={{opacity: 0, y: 10}} animate={{opacity: 1, y: 0}} transition={{duration: 0.25}}>
@@ -348,7 +388,7 @@ function Workspace({session}: {session: Session}) {
               {index % 2 === 0 ? <BookOpen size={17}/> : <Landmark size={17}/>}<span>{text}</span><ArrowRight size={14}/></button>)}</div>
           </motion.section>}
           {turns.map((turn, i) => <div className="turn" key={turn.id || i}><p className="question">{turn.question}</p>
-            {turn.result ? <AnswerCard answer={turn.result} open={setTarget}/> : <div role="status" className="thinking"><span/> Retrieving evidence and checking citations…</div>}</div>)}
+            {turn.result ? <><AnswerCard answer={turn.result} open={setTarget}/><AnswerMetrics answer={turn.result}/><VerificationDetails answer={turn.result} conversationId={conversation} session={session} open={setTarget}/></> : <div role="status" className="thinking"><span/> Retrieving evidence and checking citations…</div>}</div>)}
           <div ref={end}/>
         </div>
         <div className="composer-wrap">
@@ -361,6 +401,10 @@ function Workspace({session}: {session: Session}) {
             {selected.length > 0 && <span className={visible.length ? "scan-warn" : "scan-ok"}>{visible.length ? <ShieldAlert size={15}/> : <ShieldCheck size={15}/>}
               {visible.length ? `${visible.length} flagged ${visible.length === 1 ? "span" : "spans"}` : "No flagged spans"}</span>}
           </div>
+          {enhanced && <div className="row">
+            <label className="muted">Applicable as of <input type="date" value={asOf} onChange={event => setAsOf(event.target.value)}/></label>
+            <label className="check muted"><input type="checkbox" checked={compareBaseline} onChange={event => setCompareBaseline(event.target.checked)}/> Compare with baseline (extra AI request)</label>
+          </div>}
           <form className="composer" onSubmit={ask}>
             <Button variant="ghost" aria-label="Attach document" title="Attach document" onClick={() => openUpload()}><Paperclip size={20}/></Button>
             <textarea ref={composer} value={question} onChange={event => setQuestion(event.target.value)} maxLength={2000} rows={1} aria-label="Legal research question" placeholder="Ask a question about your documents…"
@@ -385,13 +429,28 @@ function Workspace({session}: {session: Session}) {
             <Button variant="ghost" disabled={pending === doc.id || doc.status !== "indexed"} title="Reindex" aria-label="Reindex document" onClick={() => changeDocument(doc, "reindex")}><RefreshCw size={16} className={pending === doc.id ? "spin" : ""}/></Button>
             <Button variant="ghost" disabled={pending === doc.id} onClick={() => setDeleteDoc(doc)}>Delete</Button>
           </div>
+          {doc.status === "indexed" && (doc.finding_count > 0 || enhanced) && <div className="document-insights">
+            <ScanResults document={doc} session={session}/>
+            {enhanced && <LegalVersions document={doc} session={session} researcher={researcher}/>}
+          </div>}
         </article>)}
       </section>}
       {view === "alerts" && <section className="content-page"><div className="page-heading"><div><h1>Security alerts</h1><p>Inspect flagged passages in their original context.</p></div></div>
         {!alerts.length && <div className="empty-panel"><ShieldCheck size={31}/><h2>No flagged passages</h2><p>Findings from indexed documents will appear here.</p></div>}
         {alerts.map(item => <FindingCard item={item} key={item.id} onOpen={() => setTarget({documentId: item.document_id, page: item.page, findingId: item.id})}/>)}
       </section>}
-      {view === "research" && researcher && <Research session={session} docs={docs}/>}
+      {view === "studio" && <GenerationStudio session={session} docs={docs} open={setTarget}/>}
+      {view === "restoration" && <DocumentRestoration session={session} documents={docs}/>}
+      {view === "research" && (researcher ?
+        <Research session={session}/> :
+        <section className="content-page">
+          <div className="page-heading"><div><h1>AI Performance &amp; Analytics</h1><p>Explore model results and training graphs.</p></div></div>
+          {workspaceAccess === null && <p className="notice error" role="alert">Could not check analytics access. Refresh the page to try again.</p>}
+          {workspaceAccess && <div className="empty-panel">
+            <FlaskConical size={28}/><h2>Researcher access required</h2>
+            <p>Ask your workspace administrator to grant researcher access, then sign out and sign back in.</p>
+          </div>}
+        </section>)}
     </main>
     {uploadOpen && <UploadDialog session={session} researcher={researcher} initial={initialFile} close={() => setUploadOpen(false)} complete={completion}/>}
     {target && <Viewer key={`${target.documentId}-${target.page}-${target.findingId || target.citation?.start_offset || ""}`} session={session} target={target} onClose={() => setTarget(undefined)}/>}
@@ -403,13 +462,78 @@ function Workspace({session}: {session: Session}) {
   </div>;
 }
 
+function ResetPassword({verified, done}: {verified: boolean; done: () => void}) {
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!supabase || !verified || busy) return;
+    const data = new FormData(event.currentTarget);
+    const password = String(data.get("password"));
+    if (password.length < 8) {setError("Password must be at least 8 characters."); return;}
+    if (password !== data.get("confirm")) {setError("Passwords do not match."); return;}
+    setError(""); setBusy(true);
+    try {
+      const {error: failure} = await supabase.auth.updateUser({password});
+      if (failure) setError(failure.message);
+      else setSaved(true);
+    } catch { setError("Supabase Auth could not be reached."); }
+    finally { setBusy(false); }
+  }
+
+  async function cancel() {
+    if (!verified || !supabase) {done(); return;}
+    setError(""); setBusy(true);
+    try {
+      const {error: failure} = await supabase.auth.signOut({scope: "local"});
+      if (failure) setError(failure.message);
+      else done();
+    } catch { setError("Supabase Auth could not be reached."); }
+    finally { setBusy(false); }
+  }
+
+  return <main className="login"><AuthVisual/><div className="login-content">
+    {saved ? <div className="form-stack login-form"><h2>Password updated</h2>
+      <Button onClick={done}>Continue to workspace</Button>
+    </div> : verified ? <form className="form-stack login-form" onSubmit={save}>
+      <h2>Set a new password</h2><p>Choose a password with at least 8 characters.</p>
+      {error && <p role="alert" className="notice error">{error}</p>}
+      <label>New password<input name="password" type="password" autoComplete="new-password" minLength={8} required disabled={busy}/></label>
+      <label>Confirm new password<input name="confirm" type="password" autoComplete="new-password" minLength={8} required disabled={busy}/></label>
+      <Button type="submit" disabled={busy}>{busy ? "Please wait…" : "Save new password"}</Button>
+      <Button type="button" variant="outline" disabled={busy} onClick={cancel}>Cancel reset</Button>
+    </form> : <div className="form-stack login-form"><h2>Email link unavailable</h2>
+      <p>The link may have expired or already been used. You can request a new link from the sign-in screen.</p>
+      <Button onClick={done}>Return to LegalShield</Button>
+    </div>}
+  </div></main>;
+}
+
 export default function Home() {
-  const [session, setSession] = useState<Session | null>();
+  const [auth, setAuth] = useState<{session: Session | null; recovery: ReturnType<typeof passwordRecoveryMode>}>();
   useEffect(() => {
-    if (!supabase) {setSession(null); return;}
-    const {data: {subscription}} = supabase.auth.onAuthStateChange((_event, current) => setSession(current));
-    return () => subscription.unsubscribe();
+    if (!supabase) {setAuth({session: null, recovery: null}); return;}
+    // INITIAL_SESSION may arrive before the recovery notification.
+    let active = true;
+    if (passwordRecoveryMode(null) === "pending") {
+      void supabase.auth.initialize().then(({error}) => {
+        if (!active || !error) return;
+        failPasswordRecovery();
+        setAuth(current => ({session: current?.session ?? null, recovery: "unavailable"}));
+      });
+    }
+    const {data: {subscription}} = supabase.auth.onAuthStateChange((_event, session) => {
+      setAuth({session, recovery: passwordRecoveryMode(session)});
+    });
+    return () => {active = false; subscription.unsubscribe();};
   }, []);
-  if (session === undefined) return <main className="boot" role="status"><Brand/><p>Opening your workspace…</p></main>;
+  if (!auth || auth.recovery === "pending") return <main className="boot" role="status"><Brand/><p>Opening LegalShield…</p></main>;
+  const {session, recovery} = auth;
+  if (recovery) return <ResetPassword verified={recovery === "verified"} done={() => {
+    clearPasswordRecovery();
+    setAuth(current => ({session: current?.session ?? null, recovery: null}));
+  }}/>;
   return session ? <Workspace key={session.user.id} session={session}/> : <SignIn/>;
 }

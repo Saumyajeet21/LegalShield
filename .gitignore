@@ -9,3 +9,5 @@ node_modules/
 *.ndjson
 *.log
 test_upload.txt
+/artifacts/
+/research-data/

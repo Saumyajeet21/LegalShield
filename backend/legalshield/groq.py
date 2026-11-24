@@ -3,6 +3,8 @@ import json
 import logging
 import re
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import httpx
 from fastapi import HTTPException
@@ -10,6 +12,7 @@ from fastapi import HTTPException
 from .config import settings
 
 logger = logging.getLogger(__name__)
+_usage = ContextVar("laven_groq_usage", default=None)
 
 
 class Groq:
@@ -22,8 +25,20 @@ class Groq:
                                        timeout=httpx.Timeout(48, connect=10),
                                        headers={"Authorization": f"Bearer {self.key}"})
 
+    @contextmanager
+    def track_usage(self):
+        usage = {"completion_attempts": 0, "usage_responses": 0, "prompt_tokens": 0, "completion_tokens": 0}
+        scope = _usage.set(usage)
+        try:
+            yield usage
+        finally:
+            _usage.reset(scope)
+
     async def request(self, method: str, path: str, **kwargs):
         for attempt in range(3):
+            usage = _usage.get()
+            if usage is not None and path == "chat/completions":
+                usage["completion_attempts"] += 1
             try:
                 response = await self.client.request(method, path, **kwargs)
             except httpx.RequestError:
@@ -77,14 +92,24 @@ class Groq:
         self.model_checked = time.monotonic() + 300
         return self.model
 
-    async def json(self, instruction: str, data: dict, *, max_tokens: int = 2200) -> dict:
+    async def json(self, instruction: str, data: dict, *, max_tokens: int = 2200, temperature: float = 0,
+                   top_p: float | None = None) -> dict:
         await self.verify()
         result = await self.request("POST", "chat/completions", json={
-            "model": self.model, "temperature": 0, "max_completion_tokens": max_tokens,
+            "model": self.model, "temperature": temperature, "max_completion_tokens": max_tokens,
+            **({"top_p": top_p} if top_p is not None else {}),
             "response_format": {"type": "json_object"},
-            "messages": [{"role": "system", "content": instruction},
+            "messages": [{"role": "system", "content": "Return a valid JSON object.\n\n" + instruction},
                          {"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
         })
+        usage = _usage.get()
+        metadata = result.get("usage") if isinstance(result, dict) else None
+        if usage is not None and isinstance(metadata, dict):
+            fields = ("prompt_tokens", "completion_tokens")
+            if all(type(metadata.get(key)) is int and metadata[key] >= 0 for key in fields):
+                usage["usage_responses"] += 1
+                for key in fields:
+                    usage[key] += metadata[key]
         # If request() already recovered a dict from a bare-array response, return it directly.
         if isinstance(result, dict) and "choices" not in result:
             return result
